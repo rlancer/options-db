@@ -5,6 +5,7 @@ import type { UIMessage } from "ai";
 import { chartFitsResult, inferChartSpec, wantsChart, type ChartSpec } from "./chart-spec";
 import { normalizeDeskBrief, type DeskBrief, type DeskBriefInput } from "./copilot-desk";
 import { normalizeSuggestedTrades, type SuggestedTrades } from "./copilot-trades";
+import { looksLikeDsmlToolMarkup, parseDsmlToolCalls, stripDsmlToolMarkup } from "./dsml";
 
 export type ShareTurn = {
   role: "user" | "assistant";
@@ -65,10 +66,76 @@ export function mergeAssistantShareTurns(earlier: ShareTurn, later: ShareTurn): 
   return merged;
 }
 
+/**
+ * Recover desk / trades / chart when DeepSeek left DSML tool markup in text
+ * instead of structured tool parts. Strips the markup and prefers the desk
+ * overview as visible content.
+ */
+export function healShareTurnFromDsml(turn: ShareTurn): ShareTurn {
+  if (turn.role !== "assistant") return turn;
+  const content = typeof turn.content === "string" ? turn.content : "";
+  if (!looksLikeDsmlToolMarkup(content)) return turn;
+
+  const calls = parseDsmlToolCalls(content);
+  let desk = turn.desk ?? null;
+  let trades = turn.trades ?? null;
+  let chart = turn.chart ?? null;
+  for (const call of calls) {
+    if (call.name === "publish_desk" && !desk) {
+      const next = normalizeDeskBrief(call.args as DeskBriefInput);
+      if (next) desk = next;
+    }
+    if (call.name === "suggest_trades" && !trades) {
+      const next = normalizeSuggestedTrades(call.args as { trades?: unknown; skip_reason?: unknown });
+      if (next) trades = next;
+    }
+    if (call.name === "render_chart" && !chart) {
+      const next = asChartSpec(call.args);
+      if (next) chart = next;
+    }
+  }
+
+  const stripped = stripDsmlToolMarkup(content);
+  const nextContent = (desk?.overview || stripped || "").trim()
+    || (turn.reasoning ? "(see reasoning)" : "");
+
+  const out: ShareTurn = { ...turn, content: nextContent };
+  if (desk) out.desk = desk;
+  if (trades) out.trades = trades;
+  if (chart) out.chart = chart;
+  return out;
+}
+
+function shareTurnFromRecord(rec: Record<string, unknown>): ShareTurn {
+  return {
+    role: "assistant",
+    content: typeof rec.content === "string" ? rec.content : "",
+    ...(typeof rec.reasoning === "string" ? { reasoning: rec.reasoning } : {}),
+    ...(typeof rec.sql === "string" ? { sql: rec.sql } : {}),
+    ...(rec.chart && typeof rec.chart === "object" ? { chart: rec.chart as ChartSpec } : {}),
+    ...(rec.desk && typeof rec.desk === "object" ? { desk: rec.desk as DeskBrief } : {}),
+    ...(rec.trades && typeof rec.trades === "object" ? { trades: rec.trades as SuggestedTrades } : {}),
+    ...(typeof rec.ts === "number" ? { ts: rec.ts } : {}),
+  };
+}
+
+function recordFromShareTurn(turn: ShareTurn, result?: unknown): Record<string, unknown> {
+  const next: Record<string, unknown> = { role: "assistant", content: turn.content };
+  if (turn.reasoning) next.reasoning = turn.reasoning;
+  if (turn.sql) next.sql = turn.sql;
+  if (turn.chart) next.chart = turn.chart;
+  if (turn.desk) next.desk = turn.desk;
+  if (turn.trades) next.trades = turn.trades;
+  if (turn.ts != null) next.ts = turn.ts;
+  if (result != null) next.result = result;
+  return next;
+}
+
 /** Collapse recovery debris: consecutive assistants → one turn; drop empty shells. */
 export function coalesceAssistantShareTurns(turns: ShareTurn[]): ShareTurn[] {
   const out: ShareTurn[] = [];
-  for (const turn of turns) {
+  for (const raw of turns) {
+    const turn = raw.role === "assistant" ? healShareTurnFromDsml(raw) : raw;
     if (turn.role !== "assistant") {
       out.push(turn);
       continue;
@@ -87,6 +154,7 @@ export function coalesceAssistantShareTurns(turns: ShareTurn[]): ShareTurn[] {
 /**
  * Same coalesce for stored share/timeline JSON rows ({role, content, …}).
  * Used on share write + public read so existing multi-bubble shares heal.
+ * Also recovers DeepSeek DSML tool markup left in assistant content.
  */
 export function coalesceAssistantMessageRecords(messages: unknown): Record<string, unknown>[] {
   if (!Array.isArray(messages)) return [];
@@ -101,39 +169,17 @@ export function coalesceAssistantMessageRecords(messages: unknown): Record<strin
       out.push(rec);
       continue;
     }
-    const asTurn: ShareTurn = {
-      role: "assistant",
-      content: typeof rec.content === "string" ? rec.content : "",
-      ...(typeof rec.reasoning === "string" ? { reasoning: rec.reasoning } : {}),
-      ...(typeof rec.sql === "string" ? { sql: rec.sql } : {}),
-      ...(rec.chart && typeof rec.chart === "object" ? { chart: rec.chart as ChartSpec } : {}),
-      ...(rec.desk && typeof rec.desk === "object" ? { desk: rec.desk as DeskBrief } : {}),
-      ...(rec.trades && typeof rec.trades === "object" ? { trades: rec.trades as SuggestedTrades } : {}),
-      ...(typeof rec.ts === "number" ? { ts: rec.ts } : {}),
-    };
+    const asTurn = healShareTurnFromDsml(shareTurnFromRecord(rec));
+    // Write healed desk/content back onto the record before merge / push.
+    Object.assign(rec, recordFromShareTurn(asTurn, rec.result));
     const prev = out[out.length - 1];
     if (prev?.role === "assistant") {
-      const earlier: ShareTurn = {
-        role: "assistant",
-        content: typeof prev.content === "string" ? prev.content : "",
-        ...(typeof prev.reasoning === "string" ? { reasoning: prev.reasoning } : {}),
-        ...(typeof prev.sql === "string" ? { sql: prev.sql } : {}),
-        ...(prev.chart && typeof prev.chart === "object" ? { chart: prev.chart as ChartSpec } : {}),
-        ...(prev.desk && typeof prev.desk === "object" ? { desk: prev.desk as DeskBrief } : {}),
-        ...(prev.trades && typeof prev.trades === "object" ? { trades: prev.trades as SuggestedTrades } : {}),
-        ...(typeof prev.ts === "number" ? { ts: prev.ts } : {}),
-      };
+      const earlier = healShareTurnFromDsml(shareTurnFromRecord(prev));
       const merged = mergeAssistantShareTurns(earlier, asTurn);
-      const next: Record<string, unknown> = { role: "assistant", content: merged.content };
-      if (merged.reasoning) next.reasoning = merged.reasoning;
-      if (merged.sql) next.sql = merged.sql;
-      if (merged.chart) next.chart = merged.chart;
-      if (merged.desk) next.desk = merged.desk;
-      if (merged.trades) next.trades = merged.trades;
-      if (merged.ts != null) next.ts = merged.ts;
-      // Preserve result from whichever side had it (share hydration).
-      if (rec.result != null) next.result = rec.result;
-      else if (prev.result != null) next.result = prev.result;
+      const next = recordFromShareTurn(
+        merged,
+        rec.result != null ? rec.result : prev.result,
+      );
       out[out.length - 1] = next;
       continue;
     }
@@ -142,7 +188,6 @@ export function coalesceAssistantMessageRecords(messages: unknown): Record<strin
   }
   return out;
 }
-
 type ToolPayload = {
   sql?: unknown;
   result?: { columns?: unknown; rows?: unknown } | null;

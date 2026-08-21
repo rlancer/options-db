@@ -65,7 +65,8 @@ function messageRecord(value: unknown): Record<string, unknown> | null {
  * message expanded; only a large safety ceiling applies.
  */
 export function excerptFromMessages(messages: unknown, title: string | null): string {
-  const rows = Array.isArray(messages) ? messages : [];
+  // Heal DSML / stacked assistants before picking the public excerpt.
+  const rows = coalesceAssistantMessageRecords(messages);
   let text = "";
   for (const row of rows) {
     const rec = messageRecord(row);
@@ -127,9 +128,11 @@ function slimPreviewMessage(rec: Record<string, unknown>): Record<string, unknow
   if (typeof rec.sql === "string" && rec.sql.trim()) out.sql = rec.sql.slice(0, 20_000);
   if (typeof rec.ts === "number" && Number.isFinite(rec.ts)) out.ts = rec.ts;
   if (rec.chart && typeof rec.chart === "object" && !Array.isArray(rec.chart)) out.chart = rec.chart;
+  if (rec.desk && typeof rec.desk === "object" && !Array.isArray(rec.desk)) out.desk = rec.desk;
+  if (rec.trades && typeof rec.trades === "object" && !Array.isArray(rec.trades)) out.trades = rec.trades;
   // Omit result rows from the list payload — AssistantMessageBody re-runs SQL
   // when needed, same path as snapshot-less shares.
-  if (!out.content && !out.sql && !out.reasoning && !out.chart) return null;
+  if (!out.content && !out.sql && !out.reasoning && !out.chart && !out.desk && !out.trades) return null;
   return out;
 }
 

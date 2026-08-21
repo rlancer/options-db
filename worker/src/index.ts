@@ -2277,7 +2277,7 @@ async function createShare(env: Env, req: Request, ctx: ExecutionContext): Promi
  * share_id is the capability); unknown or expired ids are indistinguishable
  * 404s. created_ip / created_ua are never selected — privacy by construction.
  */
-async function getSharedChat(env: Env, shareId: string, _ctx: ExecutionContext): Promise<Response> {
+async function getSharedChat(env: Env, shareId: string, ctx: ExecutionContext): Promise<Response> {
   if (!SHARE_ID_RE.test(shareId)) return json(env, { error: "not found" }, 404);
   const row = await env.SCHEMA_DB.prepare(
     `SELECT share_id, chat_id, title, mode, model, messages, source_sql, created_at, expires_at, bot_handle
@@ -2303,7 +2303,20 @@ async function getSharedChat(env: Env, shareId: string, _ctx: ExecutionContext):
     /* rows are written by us; tolerate a corrupt one rather than 500 */
   }
   if (Array.isArray(messages)) {
-    messages = coalesceAssistantMessageRecords(messages);
+    const healed = coalesceAssistantMessageRecords(messages);
+    // Persist DSML / stacked-assistant heals so the timeline and next read
+    // see structured desk content without re-parsing markup forever.
+    if (JSON.stringify(healed) !== JSON.stringify(messages)) {
+      const messagesJson = JSON.stringify(healed);
+      ctx.waitUntil(
+        env.SCHEMA_DB.prepare(
+          `UPDATE shared_chats SET messages = ?1, updated_at = ?2 WHERE share_id = ?3`,
+        ).bind(messagesJson, Date.now(), row.share_id).run().then(() => undefined).catch((error) => {
+          console.warn("share DSML heal persist failed", error);
+        }),
+      );
+    }
+    messages = healed;
   }
   const linked = row.chat_id ? await listChatTickers(env.SCHEMA_DB, row.chat_id) : [];
   let tickers = [...new Set(linked.map((row) => row.ticker.trim().toUpperCase()).filter(Boolean))];
